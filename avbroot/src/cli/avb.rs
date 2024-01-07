@@ -22,9 +22,9 @@ use clap::{Args, Parser, Subcommand};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
+use tracing::{info, info_span, warn, Span};
 
 use crate::{
-    cli::{status, warning},
     crypto::{self, PassphraseSource},
     format::avb::{
         self, AlgorithmType, AppendedDescriptorMut, AppendedDescriptorRef, Descriptor, Footer,
@@ -99,7 +99,11 @@ fn promote_insecure_hash_algorithm(algorithm: &str) -> &str {
     const NEW_ALGORITHM: &str = "sha256";
 
     if INSECURE_ALGORITHMS.contains(&algorithm) {
-        warning!("Changing insecure hash algorithm {algorithm} to {NEW_ALGORITHM}");
+        warn!(
+            old = algorithm,
+            new = NEW_ALGORITHM,
+            "Changing insecure hash algorithm",
+        );
         NEW_ALGORITHM
     } else {
         algorithm
@@ -159,14 +163,21 @@ fn write_raw_and_verify(
 
     let raw_file = write_raw(path, reader, copy_size, cancel_signal)?;
 
-    let result = verify_and_repair(None, raw_file.reopen()?, descriptor, true, cancel_signal);
+    let result = verify_and_repair(
+        None,
+        raw_file.reopen()?,
+        descriptor,
+        true,
+        cancel_signal,
+        &Span::current(),
+    );
 
     // Chop off the old hash tree and FEC data.
     raw_file.set_len(f.original_image_size)?;
 
     if let Err(e) = result {
         if ignore_invalid {
-            warning!("{e:?}");
+            warn!("{e:?}");
         } else {
             return Err(e);
         }
@@ -358,16 +369,16 @@ fn sign_or_clear(info: &mut AvbInfo, orig_header: &Header, key_group: &KeyGroup)
     match sign_action {
         SignAction::None => {
             if originally_signed {
-                status!("Preserving original AVB header signature");
+                info!("Preserving original AVB header signature");
             } else {
-                status!("Leaving AVB header unsigned");
+                info!("Leaving AVB header unsigned");
             }
         }
         SignAction::Sign => {
             if originally_signed {
-                status!("Replacing AVB header signature");
+                info!("Replacing AVB header signature");
             } else {
-                status!("Signing AVB header");
+                info!("Signing AVB header");
             }
 
             let Some(key_path) = &key_group.key else {
@@ -389,9 +400,9 @@ fn sign_or_clear(info: &mut AvbInfo, orig_header: &Header, key_group: &KeyGroup)
         }
         SignAction::Clear => {
             if originally_signed {
-                status!("Clearing AVB header signature");
+                info!("Clearing AVB header signature");
             } else {
-                status!("Leaving AVB header unsigned");
+                info!("Leaving AVB header unsigned");
             }
 
             info.header.algorithm_type = AlgorithmType::None;
@@ -451,15 +462,15 @@ pub fn verify_headers(
 
         if let Some(e) = expected_key {
             if k == e {
-                status!("{prefix}");
+                info!("{prefix}");
             } else {
                 bail!("{prefix}, but is signed by an untrusted key");
             }
         } else {
-            warning!("{prefix}, but parent does not list a trusted key");
+            warn!("{prefix}, but parent does not list a trusted key");
         }
     } else {
-        status!("{name} has an unsigned vbmeta header");
+        info!("{name} has an unsigned vbmeta header");
     }
 
     for descriptor in &header.descriptors {
@@ -501,7 +512,9 @@ fn verify_and_repair(
     descriptor: AppendedDescriptorRef,
     repair: bool,
     cancel_signal: &AtomicBool,
+    parent_span: &Span,
 ) -> Result<()> {
+    let _span = info_span!(parent: parent_span, "image", name = name.unwrap_or_default()).entered();
     let suffix = match name {
         Some(n) => format!(" for: {n}"),
         None => String::new(),
@@ -509,18 +522,18 @@ fn verify_and_repair(
 
     match descriptor {
         AppendedDescriptorRef::HashTree(d) => {
-            status!("Verifying hash tree descriptor{suffix}");
+            info!("Verifying hash tree descriptor");
 
             match d.verify(&file, cancel_signal) {
                 Err(e @ avb::Error::HashTree(_)) if repair => {
-                    warning!("Failed to verify hash tree descriptor{suffix}: {e}");
-                    warning!("Attempting to repair using FEC data{suffix}");
+                    warn!("Failed to verify hash tree descriptor: {e}");
+                    warn!("Attempting to repair using FEC data");
 
                     d.repair(&file, &file, cancel_signal)
                         .with_context(|| format!("Failed to repair data{suffix}"))?;
 
                     d.verify(&file, cancel_signal).map(|_| {
-                        status!("Successfully repaired data{suffix}");
+                        info!("Successfully repaired data");
                     })
                 }
                 ret => ret,
@@ -528,7 +541,7 @@ fn verify_and_repair(
             .with_context(|| format!("Failed to verify hash tree descriptor{suffix}"))?;
         }
         AppendedDescriptorRef::Hash(d) => {
-            status!("Verifying hash descriptor{suffix}");
+            info!("Verifying hash descriptor");
 
             file.rewind()?;
             d.verify(file, cancel_signal)
@@ -547,6 +560,8 @@ pub fn verify_descriptors(
     repair: bool,
     cancel_signal: &AtomicBool,
 ) -> Result<()> {
+    let parent_span = Span::current();
+
     descriptors
         .par_iter()
         .map(|(name, descriptor)| {
@@ -560,7 +575,7 @@ pub fn verify_descriptors(
                 // refer to partitions that exist on the device, but not in the
                 // OTA.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    warning!("Partition image does not exist: {path:?}");
+                    warn!(?path, "Partition image does not exist");
                     return Ok(());
                 }
                 Err(e) => {
@@ -574,6 +589,7 @@ pub fn verify_descriptors(
                 descriptor.try_into()?,
                 repair,
                 cancel_signal,
+                &parent_span,
             )
         })
         .collect()
@@ -706,7 +722,7 @@ fn verify_subcommand(cli: &VerifyCli, cancel_signal: &AtomicBool) -> Result<()> 
     )?;
     verify_descriptors(&directory, &descriptors, cli.repair, cancel_signal)?;
 
-    status!("Successfully verified all vbmeta signatures and hashes");
+    info!("Successfully verified all vbmeta signatures and hashes");
 
     Ok(())
 }

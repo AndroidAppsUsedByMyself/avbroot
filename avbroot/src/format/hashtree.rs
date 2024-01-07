@@ -667,7 +667,7 @@ mod tests {
                 0xae, 0x1e, 0x00, 0xa3
             ],
         );
-        assert_eq!(hash_tree_data, &[]);
+        assert_eq!(hash_tree_data, &[] as &[u8]);
 
         // Try larger input that spans multiple blocks are results in an actual
         // hash tree being created.

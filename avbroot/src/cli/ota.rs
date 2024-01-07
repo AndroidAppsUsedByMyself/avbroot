@@ -7,16 +7,15 @@ use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap, HashSet},
     ffi::{OsStr, OsString},
-    fmt::Display,
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     ops::Range,
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Mutex},
-    time::Instant,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use bytemuck::TransparentWrapper;
 use cap_std::{ambient_authority, fs::Dir};
 use cap_tempfile::TempDir;
 use clap::{value_parser, ArgAction, Args, Parser, Subcommand};
@@ -24,11 +23,13 @@ use rayon::{iter::IntoParallelRefIterator, prelude::ParallelIterator};
 use rsa::RsaPrivateKey;
 use tempfile::NamedTempFile;
 use topological_sort::TopologicalSort;
+use tracing::{info, info_span, warn};
+use valuable::{Listable, Valuable, Value};
 use x509_cert::Certificate;
 use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::{
-    cli::{self, status, warning},
+    cli,
     crypto::{self, PassphraseSource},
     format::{
         avb::Header,
@@ -51,26 +52,34 @@ use crate::{
     util,
 };
 
-fn joined(into_iter: impl IntoIterator<Item = impl Display>) -> String {
-    use std::fmt::Write;
+/// Small wrapper to make it possible to log Range<T> values since the valuable
+/// library doesn't natively support this type. The data is represented as a
+/// list of two elements.
+#[derive(TransparentWrapper)]
+#[repr(transparent)]
+struct ValuableRange<T: Valuable>(Range<T>);
 
-    let mut result = String::new();
-
-    for (i, item) in into_iter.into_iter().enumerate() {
-        if i > 0 {
-            result.push_str(", ");
-        }
-
-        write!(result, "{item}").expect("Failed to allocate");
+impl<T: Valuable> From<Range<T>> for ValuableRange<T> {
+    fn from(value: Range<T>) -> Self {
+        Self(value)
     }
-
-    result
 }
 
-fn sorted<T: Ord>(iter: impl Iterator<Item = T>) -> Vec<T> {
-    let mut items = iter.collect::<Vec<_>>();
-    items.sort();
-    items
+impl<T: Valuable> Listable for ValuableRange<T> {
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (2, Some(2))
+    }
+}
+
+impl<T: Valuable> Valuable for ValuableRange<T> {
+    fn as_value(&self) -> valuable::Value<'_> {
+        Value::Listable(self)
+    }
+
+    fn visit(&self, visit: &mut dyn valuable::Visit) {
+        visit.visit_value(self.0.start.as_value());
+        visit.visit_value(self.0.end.as_value());
+    }
 }
 
 pub struct RequiredImages(HashSet<String>);
@@ -149,8 +158,10 @@ fn open_input_files(
         .collect::<HashSet<_>>();
 
     for name in all_images {
+        let _span = info_span!("image", name).entered();
+
         if let Some(path) = external_images.get(name) {
-            status!("Opening external image: {name}: {path:?}");
+            info!(?path, "Opening external image");
 
             let file = File::open(path)
                 .map(PSeekFile::new)
@@ -163,7 +174,7 @@ fn open_input_files(
                 },
             );
         } else {
-            status!("Extracting from original payload: {name}");
+            info!("Extracting from original payload");
 
             let file = tempfile::tempfile()
                 .map(PSeekFile::new)
@@ -207,10 +218,7 @@ fn patch_boot_images<'a, 'b: 'a>(
 
     let boot_partitions = required_images.iter_boot().collect::<Vec<_>>();
 
-    status!(
-        "Patching boot images: {}",
-        joined(sorted(boot_partitions.iter())),
-    );
+    info!(images = boot_partitions.as_value(), "Patching boot images");
 
     boot::patch_boot_images(
         &boot_partitions,
@@ -229,12 +237,7 @@ fn patch_boot_images<'a, 'b: 'a>(
         &boot_patchers,
         cancel_signal,
     )
-    .with_context(|| {
-        format!(
-            "Failed to patch boot images: {}",
-            joined(sorted(boot_partitions.iter())),
-        )
-    })?;
+    .with_context(|| format!("Failed to patch boot images: {boot_partitions:?}"))?;
 
     Ok(())
 }
@@ -252,7 +255,9 @@ fn patch_system_image<'a, 'b: 'a>(
         bail!("No system partition found");
     };
 
-    status!("Patching system image: {target}");
+    let _span = info_span!("image", name = target).entered();
+
+    info!("Patching system image");
 
     let input_file = input_files.get_mut(target).unwrap();
 
@@ -280,7 +285,10 @@ fn patch_system_image<'a, 'b: 'a>(
 
     input_file.state = InputFileState::Modified;
 
-    status!("Patched otacerts.zip offsets in {target}: {ranges:?}");
+    info!(
+        ranges = ValuableRange::wrap_slice(&ranges).as_value(),
+        "Patched otacerts.zip offsets",
+    );
 
     ranges.extend(other_ranges);
 
@@ -340,10 +348,7 @@ fn ensure_partitions_protected(
         .collect::<Vec<_>>();
 
     if !missing.is_empty() {
-        bail!(
-            "Found critical partitions that are not protected by AVB: {}",
-            joined(missing),
-        );
+        bail!("Found critical partitions that are not protected by AVB: {missing:?}");
     }
 
     Ok(())
@@ -384,7 +389,10 @@ fn get_vbmeta_patch_order(
     }
 
     if !missing.is_empty() {
-        warning!("Partitions aren't protected by AVB: {:?}", joined(missing));
+        warn!(
+            missing = missing.as_value(),
+            "Partitions aren't protected by AVB",
+        );
     }
 
     // Ensure that there's only a single root of trust. Otherwise, there could
@@ -400,7 +408,7 @@ fn get_vbmeta_patch_order(
 
     // For zero roots, let TopologicalSort report the cycle.
     if roots.len() > 1 {
-        bail!("Found multiple root vbmeta images: {}", joined(roots));
+        bail!("Found multiple root vbmeta images: {roots:?}");
     }
 
     // Compute the patching order. This only includes vbmeta images. All vbmeta
@@ -635,6 +643,8 @@ fn compress_image(
     ranges: Option<&[Range<u64>]>,
     cancel_signal: &AtomicBool,
 ) -> Result<Vec<Range<usize>>> {
+    let _span = info_span!("image", name).entered();
+
     file.rewind()?;
 
     let writer = tempfile::tempfile()
@@ -650,7 +660,10 @@ fn compress_image(
         .unwrap();
 
     if let Some(r) = ranges {
-        status!("Compressing partial image: {name}: {r:?}");
+        info!(
+            ranges = ValuableRange::wrap_slice(r).as_value(),
+            "Compressing partial image",
+        );
 
         match payload::compress_modified_image(
             &*file,
@@ -668,13 +681,13 @@ fn compress_image(
             // If we can't take advantage of the optimization, we can still
             // compress the whole image.
             Err(payload::Error::ExtentsNotInOrder) => {
-                warning!("Cannot use optimization for {name}: extents not in order");
+                warn!("Cannot use optimization: extents not in order");
             }
             Err(e) => return Err(e.into()),
         }
     }
 
-    status!("Compressing full image: {name}");
+    info!("Compressing full image");
 
     // Otherwise, compress the entire image.
     let (partition_info, operations) =
@@ -771,9 +784,13 @@ fn patch_ota_payload(
 
     let mut vbmeta_order = get_vbmeta_patch_order(&mut input_files, &vbmeta_headers)?;
 
-    status!(
-        "Patching vbmeta images: {}",
-        joined(vbmeta_order.iter().map(|(n, _)| n)),
+    info!(
+        images = vbmeta_order
+            .iter()
+            .map(|(n, _)| n)
+            .collect::<Vec<_>>()
+            .as_value(),
+        "Patching vbmeta images",
     );
 
     update_vbmeta_headers(
@@ -810,7 +827,7 @@ fn patch_ota_payload(
         })
         .collect::<Result<HashMap<_, _>>>()?;
 
-    status!("Generating new OTA payload");
+    info!("Generating new OTA payload");
 
     let mut payload_writer = PayloadWriter::new(writer, header_locked.clone(), key_ota.clone())
         .context("Failed to write payload header")?;
@@ -910,7 +927,7 @@ fn patch_ota_zip(
     }
 
     if !missing.is_empty() {
-        bail!("Missing entries in OTA zip: {:?}", joined(missing));
+        bail!("Missing entries in OTA zip: {missing:?}");
     } else if !paths.contains(ota::PATH_METADATA) && !paths.contains(ota::PATH_METADATA_PB) {
         bail!(
             "Neither legacy nor protobuf OTA metadata files exist: {:?}, {:?}",
@@ -926,6 +943,8 @@ fn patch_ota_zip(
     let mut last_entry_used_zip64 = false;
 
     for path in &paths {
+        let _span = info_span!("zip", entry = path).entered();
+
         let mut reader = zip_reader
             .by_name(path)
             .with_context(|| format!("Failed to open zip entry: {path}"))?;
@@ -984,13 +1003,13 @@ fn patch_ota_zip(
         match path.as_str() {
             ota::PATH_OTACERT => {
                 // Use the user's certificate
-                status!("Replacing zip entry: {path}");
+                info!("Replacing zip entry");
 
                 crypto::write_pem_cert(&mut writer, cert_ota)
                     .with_context(|| format!("Failed to write entry: {path}"))?;
             }
             ota::PATH_PAYLOAD => {
-                status!("Patching zip entry: {path}");
+                info!("Patching zip entry");
 
                 if reader.compression() != CompressionMethod::Stored {
                     bail!("{path} is not stored uncompressed");
@@ -1022,7 +1041,7 @@ fn patch_ota_zip(
                 payload_metadata_size = Some(m);
             }
             ota::PATH_PROPERTIES => {
-                status!("Patching zip entry: {path}");
+                info!("Patching zip entry");
 
                 // payload.bin is guaranteed to be patched first.
                 writer
@@ -1030,7 +1049,7 @@ fn patch_ota_zip(
                     .with_context(|| format!("Failed to write payload properties: {path}"))?;
             }
             _ => {
-                status!("Copying zip entry: {path}");
+                info!("Copying zip entry");
 
                 stream::copy(&mut reader, &mut writer, cancel_signal)
                     .with_context(|| format!("Failed to copy zip entry: {path}"))?;
@@ -1049,7 +1068,7 @@ fn patch_ota_zip(
         last_entry_used_zip64 = use_zip64;
     }
 
-    status!("Generating new OTA metadata");
+    info!("Generating new OTA metadata");
 
     let data_descriptor_size = if last_entry_used_zip64 { 24 } else { 16 };
     let metadata = ota::add_metadata(
@@ -1080,7 +1099,7 @@ fn extract_ota_zip(
         }
     }
 
-    status!("Extracting from the payload: {}", joined(images));
+    info!(images = images.as_value(), "Extracting from the payload");
 
     // Pre-open all output files.
     let output_files = images
@@ -1112,6 +1131,8 @@ fn extract_ota_zip(
         cancel_signal,
     )
     .context("Failed to extract images from payload")?;
+
+    info!("Successfully extracted OTA");
 
     Ok(())
 }
@@ -1166,7 +1187,7 @@ fn verify_partition_hashes(
 
 pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()> {
     if cli.boot_partition.is_some() {
-        warning!("Ignoring --boot-partition: deprecated and no longer needed");
+        warn!("Ignoring --boot-partition: deprecated and no longer needed");
     }
 
     let output = cli.output.as_ref().map_or_else(
@@ -1222,7 +1243,6 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
                 cli.magisk_preinit_device.as_deref(),
                 cli.magisk_random_seed,
                 cli.ignore_magisk_warnings,
-                move |s| warning!("{s}"),
             )
             .context("Failed to create Magisk boot image patcher")?,
         );
@@ -1232,9 +1252,6 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
         let patcher: Box<dyn BootImagePatch + Sync> = Box::new(PrepatchedImagePatcher::new(
             prepatched,
             cli.ignore_prepatched_compat + 1,
-            move |s| {
-                warning!("{s}");
-            },
         ));
 
         Some(patcher)
@@ -1242,8 +1259,6 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
         assert!(cli.root.rootless);
         None
     };
-
-    let start = Instant::now();
 
     let raw_reader = File::open(&cli.input)
         .map(PSeekFile::new)
@@ -1292,7 +1307,7 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
     temp_writer.flush().context("Failed to flush output zip")?;
 
     // We do a lot of low-level hackery. Reopen and verify offsets.
-    status!("Verifying metadata offsets");
+    info!("Verifying metadata offsets");
     temp_writer.rewind().context("Failed to seek output zip")?;
     ota::verify_metadata(
         BufReader::new(&mut temp_writer),
@@ -1301,7 +1316,7 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
     )
     .context("Failed to verify OTA metadata offsets")?;
 
-    status!("Completed after {:.1}s", start.elapsed().as_secs_f64());
+    info!("Successfully patched OTA");
 
     // NamedTempFile forces 600 permissions on temp files because it's the safe
     // option for a shared /tmp. Since we're writing to the output file's
@@ -1334,7 +1349,7 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
 
 pub fn extract_subcommand(cli: &ExtractCli, cancel_signal: &AtomicBool) -> Result<()> {
     if cli.boot_partition.is_some() {
-        warning!("Ignoring --boot-partition: deprecated and no longer needed");
+        warn!("Ignoring --boot-partition: deprecated and no longer needed");
     }
 
     let raw_reader = File::open(&cli.input)
@@ -1408,7 +1423,7 @@ pub fn verify_subcommand(cli: &VerifyCli, cancel_signal: &AtomicBool) -> Result<
         .with_context(|| format!("Failed to open for reading: {:?}", cli.input))?;
     let mut reader = BufReader::new(raw_reader);
 
-    status!("Verifying whole-file signature");
+    info!("Verifying whole-file signature");
 
     let embedded_cert = ota::verify_ota(&mut reader, cancel_signal)?;
 
@@ -1426,13 +1441,13 @@ pub fn verify_subcommand(cli: &VerifyCli, cancel_signal: &AtomicBool) -> Result<
             bail!("OTA has a valid signature, but was not signed with: {p:?}");
         }
     } else {
-        warning!("Whole-file signature is valid, but its trust is unknown");
+        warn!("Whole-file signature is valid, but its trust is unknown");
     }
 
     ota::verify_metadata(&mut reader, &metadata, header.blob_offset)
         .context("Failed to verify OTA metadata offsets")?;
 
-    status!("Verifying payload");
+    info!("Verifying payload");
 
     let pfs_raw = metadata
         .property_files
@@ -1450,7 +1465,7 @@ pub fn verify_subcommand(cli: &VerifyCli, cancel_signal: &AtomicBool) -> Result<
 
     payload::verify_payload(section_reader, &ota_cert, &properties, cancel_signal)?;
 
-    status!("Extracting partition images to temporary directory");
+    info!("Extracting partition images to temporary directory");
 
     let authority = ambient_authority();
     let temp_dir = TempDir::new(authority).context("Failed to create temporary directory")?;
@@ -1473,11 +1488,11 @@ pub fn verify_subcommand(cli: &VerifyCli, cancel_signal: &AtomicBool) -> Result<
         cancel_signal,
     )?;
 
-    status!("Verifying partition hashes");
+    info!("Verifying partition hashes");
 
     verify_partition_hashes(&temp_dir, &header, &unique_images, cancel_signal)?;
 
-    status!("Checking ramdisk's otacerts.zip");
+    info!("Checking ramdisk's otacerts.zip");
 
     {
         let required_images = RequiredImages::new(&header.manifest);
@@ -1509,7 +1524,7 @@ pub fn verify_subcommand(cli: &VerifyCli, cancel_signal: &AtomicBool) -> Result<
         }
     }
 
-    status!("Verifying AVB signatures");
+    info!("Verifying AVB signatures");
 
     let public_key = if let Some(p) = &cli.public_key_avb {
         let data = fs::read(p).with_context(|| format!("Failed to read file: {p:?}"))?;
@@ -1533,7 +1548,7 @@ pub fn verify_subcommand(cli: &VerifyCli, cancel_signal: &AtomicBool) -> Result<
     )?;
     cli::avb::verify_descriptors(&temp_dir, &descriptors, false, cancel_signal)?;
 
-    status!("Signatures are all valid!");
+    info!("Signatures are all valid!");
 
     Ok(())
 }

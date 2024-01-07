@@ -16,7 +16,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
-      RUSTFLAGS: -C strip=symbols -C target-feature=+crt-static
+      # https://github.com/rust-lang/cargo/issues/5376
+      RUSTFLAGS: -C strip=symbols -C target-feature=+crt-static --cfg tracing_unstable
     strategy:
       fail-fast: false
       matrix:

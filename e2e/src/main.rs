@@ -47,10 +47,12 @@ use avbroot::{
     },
     stream::{self, CountingWriter, HashingReader, PSeekFile, Reopen, ToWriter},
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rsa::RsaPrivateKey;
 use tempfile::{NamedTempFile, TempDir};
 use topological_sort::TopologicalSort;
+use tracing::{info, info_span};
+use tracing_subscriber::filter::Directive;
 use x509_cert::Certificate;
 use zip::{write::FileOptions, CompressionMethod, ZipWriter};
 
@@ -63,7 +65,7 @@ use crate::{
 };
 
 fn hash_file(path: &Path, cancel_signal: &AtomicBool) -> Result<[u8; 32]> {
-    println!("Calculating hash of {path:?}");
+    info!(?path, "Calculating hash");
 
     let raw_reader =
         File::open(path).with_context(|| format!("Failed to open for reading: {path:?}"))?;
@@ -947,7 +949,7 @@ fn patch_image(
     keys: &KeySet,
     cancel_signal: &AtomicBool,
 ) -> Result<()> {
-    println!("Patching {input_file:?}");
+    info!(?input_file, ?output_file, "Patching OTA");
 
     // We're intentionally using the CLI interface.
     let mut args: Vec<&OsStr> = vec![
@@ -976,7 +978,7 @@ fn patch_image(
 }
 
 fn extract_image(input_file: &Path, output_dir: &Path, cancel_signal: &AtomicBool) -> Result<()> {
-    println!("Extracting AVB partitions from {input_file:?}");
+    info!(?input_file, ?output_dir, "Extracting AVB partitions");
 
     let cli = ExtractCli::try_parse_from([
         OsStr::new("extract"),
@@ -991,7 +993,7 @@ fn extract_image(input_file: &Path, output_dir: &Path, cancel_signal: &AtomicBoo
 }
 
 fn verify_image(input_file: &Path, keys: &KeySet, cancel_signal: &AtomicBool) -> Result<()> {
-    println!("Verifying signatures in {input_file:?}");
+    info!(?input_file, "Verifying signatures");
 
     let cli = VerifyCli::try_parse_from([
         OsStr::new("verify"),
@@ -1064,11 +1066,13 @@ fn test_subcommand(cli: &TestCli, cancel_signal: &AtomicBool) -> Result<()> {
     ];
 
     for name in profiles {
+        let _span = info_span!("profile", name).entered();
+
         if Path::new(name).file_name() != Some(OsStr::new(name)) {
             bail!("Unsafe profile name: {name}");
         }
 
-        println!("Generating OTA from profile: {name}");
+        info!("Generating OTA");
 
         let profile = &config.profile[name];
 
@@ -1168,6 +1172,15 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+
+    let default_directive: Directive = cli
+        .log_level
+        .to_possible_value()
+        .unwrap()
+        .get_name()
+        .parse()
+        .expect("Broken hardcoded directive");
+    avbroot::cli::args::init_logging(default_directive, cli.log_format);
 
     match cli.command {
         Command::Test(c) => test_subcommand(&c, &cancel_signal),
