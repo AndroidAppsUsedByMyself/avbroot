@@ -4,7 +4,8 @@
  */
 
 use std::{
-    fmt, io,
+    fmt,
+    io::{self, IsTerminal},
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
@@ -122,6 +123,7 @@ pub fn init_logging(default_directive: Directive, log_format: LogFormat) {
 
     let builder = tracing_subscriber::fmt()
         .with_writer(io::stderr)
+        .with_ansi(io::stderr().is_terminal())
         .with_env_filter(filter);
 
     match log_format {
